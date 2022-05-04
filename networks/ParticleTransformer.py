@@ -159,6 +159,48 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
         return tensor
 
 
+class SequenceTrimmer(nn.Module):
+
+    def __init__(self, enabled=False, target=(0.9, 1.02), **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.enabled = enabled
+        self.target = target
+        self._counter = 0
+
+    def forward(self, x, v=None, mask=None):
+        # x: (N, C, P)
+        # v: (N, 4, P) [px,py,pz,energy]
+        # mask: (N, 1, P) -- real particle = 1, padded = 0
+        if self.enabled:
+            if mask is None:
+                mask = torch.ones_like(x[:, :1])
+            mask = mask.bool()
+
+            if self._counter < 5:
+                self._counter += 1
+            else:
+                if self.training:
+                    q = min(1, random.uniform(*self.target))
+                    maxlen = torch.quantile(mask.type_as(x).sum(dim=-1), q).long()
+                    rand = torch.rand_like(mask.type_as(x))
+                    rand.masked_fill_(~mask, -1)
+                    perm = rand.argsort(dim=-1, descending=True)
+                    mask = torch.gather(mask, -1, perm)
+                    x = torch.gather(x, -1, perm.expand_as(x))
+                    if v is not None:
+                        v = torch.gather(v, -1, perm.expand_as(v))
+                else:
+                    maxlen = mask.sum(dim=-1).max()
+                maxlen = max(maxlen, 1)
+                if maxlen < mask.size(-1):
+                    mask = mask[:, :, :maxlen]
+                    x = x[:, :, :maxlen]
+                    if v is not None:
+                        v = v[:, :, :maxlen]
+
+        return x, v, mask
+
+
 class Embed(nn.Module):
     def __init__(self, input_dim, dims, normalize_input=True, activation='gelu'):
         super().__init__()
@@ -333,12 +375,12 @@ class ParticleTransformer(nn.Module):
                  **kwargs) -> None:
         super().__init__(**kwargs)
 
-        self.trim = trim
+        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
         self.for_inference = for_inference
         self.use_amp = use_amp
-        self._counter = 0
 
-        default_cfg = dict(embed_dim=embed_dims[-1], num_heads=num_heads, ffn_ratio=4,
+        embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
+        default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
                            add_bias_kv=False, activation=activation,
                            scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True)
@@ -353,17 +395,17 @@ class ParticleTransformer(nn.Module):
             cfg_cls_block.update(cls_block_params)
         _logger.info('cfg_cls_block: %s' % str(cfg_cls_block))
 
-        self.embed = Embed(input_dim, embed_dims, activation=activation)
+        self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
         self.pair_embed = PairEmbed(
             pair_input_dim, pair_embed_dims + [cfg_block['num_heads']],
             for_onnx=for_inference) if pair_embed_dims is not None and pair_input_dim > 0 else None
         self.blocks = nn.ModuleList([Block(**cfg_block) for _ in range(num_layers)])
         self.cls_blocks = nn.ModuleList([Block(**cfg_cls_block) for _ in range(num_cls_layers)])
-        self.norm = nn.LayerNorm(embed_dims[-1])
+        self.norm = nn.LayerNorm(embed_dim)
 
         if fc_params is not None:
             fcs = []
-            in_dim = embed_dims[-1]
+            in_dim = embed_dim
             for out_dim, drop_rate in fc_params:
                 fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
                 in_dim = out_dim
@@ -373,7 +415,7 @@ class ParticleTransformer(nn.Module):
             self.fc = None
 
         # init
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dims[-1]), requires_grad=True)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
         trunc_normal_(self.cls_token, std=.02)
 
     @torch.jit.ignore
@@ -386,33 +428,7 @@ class ParticleTransformer(nn.Module):
         # mask: (N, 1, P) -- real particle = 1, padded = 0
 
         with torch.no_grad():
-            if mask is None:
-                mask = torch.ones_like(x[:, :1])
-            mask = mask.bool()
-
-            if self.trim and not self.for_inference:
-                if self._counter < 5:
-                    self._counter += 1
-                else:
-                    if self.training:
-                        q = min(1, random.uniform(0.9, 1.02))
-                        maxlen = torch.quantile(mask.type_as(x).sum(dim=-1), q).long()
-                        rand = torch.rand_like(mask.type_as(x))
-                        rand.masked_fill_(~mask, -1)
-                        perm = rand.argsort(dim=-1, descending=True)
-                        mask = torch.gather(mask, -1, perm)
-                        x = torch.gather(x, -1, perm.expand_as(x))
-                        if v is not None and self.pair_embed is not None:
-                            v = torch.gather(v, -1, perm.expand_as(v))
-                    else:
-                        maxlen = mask.sum(dim=-1).max()
-                    maxlen = max(maxlen, 1)
-                    if maxlen < mask.size(-1):
-                        mask = mask[:, :, :maxlen]
-                        x = x[:, :, :maxlen]
-                        if v is not None and self.pair_embed is not None:
-                            v = v[:, :, :maxlen]
-
+            x, v, mask = self.trimmer(x, v, mask)
             padding_mask = ~mask.squeeze(1)  # (N, P)
 
         with torch.cuda.amp.autocast(enabled=self.use_amp):
@@ -441,3 +457,76 @@ class ParticleTransformer(nn.Module):
                 output = torch.softmax(output, dim=1)
             # print('output:\n', output)
             return output
+
+
+class ParticleTransformerTagger(nn.Module):
+
+    def __init__(self,
+                 pf_input_dim,
+                 sv_input_dim,
+                 num_classes=None,
+                 # network configurations
+                 pair_input_dim=4,
+                 embed_dims=[128, 512, 128],
+                 pair_embed_dims=[64, 64, 64],
+                 num_heads=8,
+                 num_layers=8,
+                 num_cls_layers=2,
+                 block_params=None,
+                 cls_block_params={'dropout': 0, 'attn_dropout': 0, 'activation_dropout': 0},
+                 fc_params=[],
+                 activation='gelu',
+                 # misc
+                 trim=True,
+                 for_inference=False,
+                 use_amp=False,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+
+        self.use_amp = use_amp
+
+        self.pf_trimmer = SequenceTrimmer(enabled=trim and not for_inference)
+        self.sv_trimmer = SequenceTrimmer(enabled=trim and not for_inference)
+
+        self.pf_embed = Embed(pf_input_dim, embed_dims, activation=activation)
+        self.sv_embed = Embed(sv_input_dim, embed_dims, activation=activation)
+
+        self.part = ParticleTransformer(input_dim=embed_dims[-1],
+                                        num_classes=num_classes,
+                                        # network configurations
+                                        pair_input_dim=pair_input_dim,
+                                        embed_dims=[],
+                                        pair_embed_dims=pair_embed_dims,
+                                        num_heads=num_heads,
+                                        num_layers=num_layers,
+                                        num_cls_layers=num_cls_layers,
+                                        block_params=block_params,
+                                        cls_block_params=cls_block_params,
+                                        fc_params=fc_params,
+                                        activation=activation,
+                                        # misc
+                                        trim=False,
+                                        for_inference=for_inference,
+                                        use_amp=use_amp)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'part.cls_token', }
+
+    def forward(self, pf_x, pf_v=None, pf_mask=None, sv_x=None, sv_v=None, sv_mask=None):
+        # x: (N, C, P)
+        # v: (N, 4, P) [px,py,pz,energy]
+        # mask: (N, 1, P) -- real particle = 1, padded = 0
+
+        with torch.no_grad():
+            pf_x, pf_v, pf_mask = self.pf_trimmer(pf_x, pf_v, pf_mask)
+            sv_x, sv_v, sv_mask = self.sv_trimmer(sv_x, sv_v, sv_mask)
+            v = torch.cat([pf_v, sv_v], dim=2)
+            mask = torch.cat([pf_mask, sv_mask], dim=2)
+
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            pf_x = self.pf_embed(pf_x)  # after embed: (seq_len, batch, embed_dim)
+            sv_x = self.sv_embed(sv_x)
+            x = torch.cat([pf_x, sv_x], dim=0)
+
+            return self.part(x, v, mask)
